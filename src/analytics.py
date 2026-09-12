@@ -122,3 +122,21 @@ def rank_top_stocks(candles: pd.DataFrame, limit: int = 3) -> pd.DataFrame:
     )
     ranked["rank"] = ranked.groupby(["trading_date", "bucket_number"], sort=False).cumcount() + 1
     return ranked[ranked["rank"] <= limit].reset_index(drop=True)
+
+
+def aggregate_option_turnover(data: pd.DataFrame, interval_minutes: int = 5, limit: int = 5) -> pd.DataFrame:
+    """Aggregate option candles and rank turnover as volume * close."""
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    candles = aggregate_candles(data, interval_minutes)
+    if candles.empty:
+        return candles.copy()
+    candles = candles[candles["volume"] > 0].copy()
+    candles["price"] = candles["close"]
+    candles["turnover"] = candles["volume"] * candles["price"]
+    candles = candles.sort_values(
+        ["trading_date", "bucket_number", "turnover", "symbol"],
+        ascending=[True, True, False, True],
+    )
+    candles["rank"] = candles.groupby(["trading_date", "bucket_number"], sort=False).cumcount() + 1
+    return candles[candles["rank"] <= limit].reset_index(drop=True)

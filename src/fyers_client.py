@@ -15,6 +15,7 @@ from .config import Settings
 
 MASTER_URLS = {
     "cash": "https://public.fyers.in/sym_details/NSE_CM.csv",
+    "fo": "https://public.fyers.in/sym_details/NSE_FO_sym_master.json",
 }
 HISTORY_REQUEST_INTERVAL_SECONDS = 0.12
 MAX_HISTORY_RETRIES = 4
@@ -102,6 +103,17 @@ class FyersClient:
             raise ValueError(f"Unknown master type: {kind}")
         response = requests.get(MASTER_URLS[kind], timeout=30)
         response.raise_for_status()
+        if kind == "fo":
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError("Fyers FO master response was not a JSON object")
+            rows = []
+            for symbol, record in data.items():
+                if isinstance(record, dict):
+                    row = record.copy()
+                    row.setdefault("symTicker", symbol)
+                    rows.append(row)
+            return pd.DataFrame(rows)
         from io import StringIO
 
         return pd.read_csv(StringIO(response.text), header=None)

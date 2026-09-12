@@ -9,12 +9,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from src.analytics import aggregate_candles, rank_top_stocks
+from src.analytics import aggregate_candles, aggregate_option_turnover, rank_top_stocks
 from src.config import Settings
 from src.fyers_client import FyersClient
 from src.history_store import clear_all_downloads, clear_download, load_state, save_symbol_result
 from src.market_socket import MarketSocket
-from src.universe import build_equity_universe, load_symbol_list
+from src.universe import build_equity_universe, build_option_universe, load_symbol_list, month_end_tuesday, option_expiries_for_underlyings
 
 st.set_page_config(page_title="F&O Turnover Leaders", page_icon="/", layout="wide")
 
@@ -23,6 +23,12 @@ st.set_page_config(page_title="F&O Turnover Leaders", page_icon="/", layout="wid
 def load_universe() -> pd.DataFrame:
     client = FyersClient(Settings.from_environment())
     return build_equity_universe(client.download_master("cash"))
+
+
+@st.cache_data(ttl=24 * 60 * 60)
+def load_fo_master() -> pd.DataFrame:
+    client = FyersClient(Settings.from_environment())
+    return client.download_master("fo")
 
 
 @st.cache_resource
@@ -99,11 +105,27 @@ def is_market_open() -> bool:
     return now.weekday() < 5 and time(9, 15) <= now.time() <= time(15, 30)
 
 
-def render_results(raw_history: pd.DataFrame, interval: int) -> None:
+def option_context_from_equity_group(group: pd.DataFrame, source: str) -> dict[str, object]:
+    """Build the option scan context from one ranked equity candle group."""
+    ordered = group.sort_values("rank").head(3)
+    return {
+        "source": source,
+        "trade_date": ordered.iloc[0]["trading_date"],
+        "bucket_number": int(ordered.iloc[0]["bucket_number"]),
+        "bucket_start": ordered.iloc[0]["bucket_start"],
+        "bucket_end": ordered.iloc[0]["bucket_end"],
+        "underlying_ltp": {
+            str(row["symbol"]).replace("NSE:", "").removesuffix("-EQ"): float(row["close"])
+            for _, row in ordered.iterrows()
+        },
+    }
+
+
+def render_results(raw_history: pd.DataFrame, interval: int) -> tuple[pd.DataFrame, dict[str, object] | None]:
     ranked = rank_top_stocks(aggregate_candles(raw_history, interval))
     if ranked.empty:
         st.warning("No positive-volume candles were available for ranking.")
-        return
+        return ranked, None
 
     latest_date = ranked["trading_date"].max()
     latest_bucket = ranked.loc[ranked["trading_date"] == latest_date, "bucket_number"].max()
@@ -127,7 +149,7 @@ def render_results(raw_history: pd.DataFrame, interval: int) -> None:
 
     with st.container(border=True):
         st.subheader("Turnover ranking by candle")
-        st.caption("LTP is the latest available close for each historical candle. New dates are highlighted.")
+        st.caption("Select one row to drive the options scan. Without selection, options use the latest candle.")
         snapshot = format_ranked_snapshot(ranked)
         styled_snapshot = snapshot.style.format(
             {
@@ -140,13 +162,197 @@ def render_results(raw_history: pd.DataFrame, interval: int) -> None:
             },
             na_rep="-",
         ).apply(highlight_new_dates, axis=None)
-        st.dataframe(styled_snapshot, hide_index=True)
+        selection = st.dataframe(
+            styled_snapshot,
+            hide_index=True,
+            key="equity_turnover_selection",
+            on_select="rerun",
+            selection_mode="single-row",
+            lazy=False,
+        )
         st.download_button(
             "Download CSV",
             snapshot.to_csv(index=False).encode("utf-8"),
             file_name=f"turnover_top3_{latest_date}_{interval}m.csv",
             mime="text/csv",
         )
+    option_group = latest
+    option_source = "latest candle"
+    selected_rows = list(getattr(getattr(selection, "selection", None), "rows", []))
+    if selected_rows:
+        selected_snapshot = snapshot.iloc[selected_rows[0]]
+        selected_date = datetime.strptime(selected_snapshot["Date"], "%Y-%m-%d").date()
+        selected_group = ranked[
+            (ranked["trading_date"] == selected_date)
+            & (ranked["bucket_start"].dt.strftime("%H:%M") == selected_snapshot["Start"])
+            & (ranked["bucket_end"].dt.strftime("%H:%M") == selected_snapshot["End"])
+        ]
+        if not selected_group.empty:
+            option_group = selected_group
+            option_source = "selected equity row"
+    return ranked, option_context_from_equity_group(option_group, option_source)
+
+
+def format_option_turnover_sheet(option_turnover: pd.DataFrame, option_universe: pd.DataFrame) -> pd.DataFrame:
+    """Build a top-contract option turnover list for one candle."""
+    if option_turnover.empty:
+        return pd.DataFrame()
+    metadata = option_universe.rename(columns={"option_symbol": "symbol"})
+    merged = option_turnover.merge(metadata, on="symbol", how="inner")
+    offset_labels = {-1: "ATM - 1", 0: "ATM", 1: "ATM + 1"}
+    result = pd.DataFrame(
+        {
+            "Date": merged["trading_date"].map(lambda value: value.strftime("%Y-%m-%d")),
+            "Start": merged["bucket_start"].dt.strftime("%H:%M"),
+            "End": merged["bucket_end"].dt.strftime("%H:%M"),
+            "Rank": merged["rank"],
+            "Underlying": merged["underlying"],
+            "Underlying LTP": merged["underlying_ltp"],
+            "ATM Strike": merged["atm_strike"],
+            "Strike Offset": merged["strike_offset"].map(offset_labels).fillna(merged["strike_offset"]),
+            "Strike": merged["strike"],
+            "Type": merged["option_type"],
+            "Option Symbol": merged["symbol"].str.replace("NSE:", "", regex=False),
+            "Volume": merged["volume"].round(0).astype("int64"),
+            "Price": merged["price"].round(2),
+            "Turnover": merged["turnover"].round(2),
+            "Complete": merged["is_complete"],
+        }
+    )
+    return result.sort_values(["Date", "Start", "Rank"]).reset_index(drop=True)
+
+
+def render_options_turnover(
+    fyers_client: FyersClient,
+    option_context: dict[str, object],
+    interval: int,
+    force_refresh: bool,
+) -> None:
+    st.subheader("Options turnover")
+    trade_date = option_context["trade_date"]
+    bucket_number = int(option_context["bucket_number"])
+    bucket_start = option_context["bucket_start"]
+    bucket_end = option_context["bucket_end"]
+    context_ltp = option_context["underlying_ltp"]
+    if not isinstance(trade_date, date) or not isinstance(context_ltp, dict):
+        st.warning("Unable to build options from the selected equity row.")
+        return
+
+    labels = {f"{symbol} ({ltp:.2f})": symbol for symbol, ltp in context_ltp.items()}
+    selected_labels = st.multiselect(
+        "Option underlyings",
+        options=list(labels),
+        default=list(labels),
+        key=f"option_underlyings_{trade_date:%Y%m%d}_{bucket_number}_{interval}",
+        help="Choose which stocks from the selected equity candle should be scanned.",
+    )
+    underlying_ltp = {
+        labels[label]: float(context_ltp[labels[label]])
+        for label in selected_labels
+    }
+    if not underlying_ltp:
+        st.info("Select at least one underlying from the equity row to scan options.")
+        return
+
+    fo_master = load_fo_master()
+    expiries = option_expiries_for_underlyings(fo_master, list(underlying_ltp))
+    if not expiries:
+        st.warning("No CE/PE option expiries found in the FO master for the latest top-three stocks.")
+        return
+    default_expiry = month_end_tuesday(trade_date)
+    default_index = min(
+        range(len(expiries)),
+        key=lambda index: abs((expiries[index] - default_expiry).days),
+    )
+    expiry = st.selectbox(
+        "Options expiry date",
+        options=expiries,
+        index=default_index,
+        format_func=lambda value: f"{value:%d %b %Y} ({value.strftime('%y%b').upper()})",
+        key=f"option_expiry_{trade_date:%Y%m}_{'_'.join(underlying_ltp)}",
+        help="Defaults to the month-end Tuesday contract for the selected trade month.",
+    )
+    option_universe = build_option_universe(fo_master, underlying_ltp, expiry, strikes_around=1)
+    if option_universe.empty:
+        st.warning(f"No ATM +/- 1 CE/PE option symbols found for {expiry:%Y-%m-%d}.")
+        return
+
+    option_symbols = option_universe["option_symbol"].tolist()
+    namespace = f"options_{trade_date:%Y%m%d}_{expiry:%Y%m%d}"
+    if force_refresh:
+        clear_download(trade_date, trade_date, "5", namespace=namespace)
+    option_state = load_state(trade_date, trade_date, "5", namespace=namespace)
+    pending_symbols = [
+        symbol for symbol in option_symbols
+        if symbol not in option_state.completed_symbols and symbol not in option_state.failed_symbols
+    ]
+    completed_count = len(option_state.completed_symbols.intersection(set(option_symbols)))
+    progress = completed_count / len(option_symbols) if option_symbols else 0
+    st.progress(progress, text=f"Downloaded {completed_count:,} / {len(option_symbols):,} option contracts ({progress:.1%})")
+    st.caption(
+        f"Source: {option_context['source']}. Trade date: {trade_date:%Y-%m-%d}. "
+        f"Candle: {bucket_start.strftime('%H:%M')} to {bucket_end.strftime('%H:%M')}. "
+        f"Expiry: {expiry:%Y-%m-%d}. Top 5 option contracts from ATM +/- 1 strikes."
+    )
+
+    if pending_symbols:
+        download_progress = st.progress(progress, text="Downloading option candles...")
+        download_status = st.empty()
+
+        def on_option_symbol(completed: int, total: int, symbol: str, frame: pd.DataFrame | None, error: str | None) -> None:
+            save_symbol_result(trade_date, trade_date, symbol, frame, error, "5", namespace=namespace)
+            current = completed_count + completed
+            ratio = current / len(option_symbols) if option_symbols else 1
+            download_progress.progress(min(ratio, 1.0), text=f"Downloaded {current:,} / {len(option_symbols):,} option contracts ({ratio:.1%})")
+            download_status.write(f"{symbol}: {'ok' if not error else error}")
+
+        fyers_client.history_for_symbols(pending_symbols, trade_date, trade_date, resolution="5", progress_callback=on_option_symbol)
+        option_state = load_state(trade_date, trade_date, "5", namespace=namespace)
+
+    selected_history = option_state.frame
+    if not selected_history.empty:
+        selected_history = selected_history[selected_history["symbol"].isin(option_symbols)]
+    if option_state.failed_symbols:
+        with st.expander(f"Option download errors ({len(option_state.failed_symbols):,})"):
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Symbol": symbol, "Error": message} for symbol, message in sorted(option_state.failed_symbols.items())]
+                ),
+                hide_index=True,
+            )
+    if selected_history.empty:
+        st.warning("Fyers returned no current-day 5-minute option candles for the selected contracts.")
+        return
+
+    option_ranked = aggregate_option_turnover(selected_history, interval, limit=5)
+    option_ranked = option_ranked[
+        (option_ranked["trading_date"] == trade_date)
+        & (option_ranked["bucket_number"] == bucket_number)
+    ]
+    sheet = format_option_turnover_sheet(option_ranked, option_universe)
+    if sheet.empty:
+        st.warning("No positive-volume option candles were available for the selected timeframe bucket.")
+        return
+    st.dataframe(
+        sheet.style.format(
+            {
+                "Underlying LTP": "{:.2f}",
+                "ATM Strike": "{:.0f}",
+                "Strike": "{:.0f}",
+                "Volume": "{:.0f}",
+                "Price": "{:.2f}",
+                "Turnover": "{:.2f}",
+            },
+            na_rep="-",
+        ),
+        hide_index=True,
+    )
+    st.download_button(
+        "Download options CSV",
+        sheet.to_csv(index=False).encode("utf-8"),
+        file_name=f"options_turnover_{expiry:%Y%m%d}_{trade_date.isoformat()}_{bucket_start.strftime('%H%M')}_{interval}m.csv",
+        mime="text/csv",
+    )
 
 
 environment_settings = Settings.from_environment()
@@ -269,6 +475,7 @@ try:
     client.set_access_token(access_token)
     if refresh:
         load_universe.clear()
+        load_fo_master.clear()
     universe = load_universe()
     stock_file = Path(__file__).with_name("- F&O Stocks.txt")
     file_symbols = load_symbol_list(stock_file) if stock_file.exists() else []
@@ -332,7 +539,9 @@ try:
             market_socket = get_market_socket(access_token)
             market_socket.start(list(watchlist_symbols))
             st.info(f"Live WebSocket: {market_socket.status}")
-        render_results(raw_history, interval)
+        ranked, option_context = render_results(raw_history, interval)
+        if not ranked.empty and option_context:
+            render_options_turnover(client, option_context, interval, force_refresh)
 
     if live_refresh_enabled:
         @st.fragment(run_every="15m")
