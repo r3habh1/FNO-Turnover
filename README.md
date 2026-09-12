@@ -34,10 +34,12 @@ Start the dashboard:
 streamlit run app.py
 ```
 
-The first screen is the Fyers OAuth login page. Use **Sign in with Fyers** and
-complete the callback. The dashboard appears only after the Fyers profile API
-confirms the session. The exchanged access token is held for the current
-Streamlit session; never commit `.env` or tokens.
+The first screen is the Fyers OAuth login page. Enter the Fyers app ID, secret
+key, and registered redirect URI, then use **Sign in with Fyers**. The app ID
+and secret are held only in the current Streamlit session when entered through
+the page. For deployment, environment variables are preferred so users do not
+need to enter developer credentials. The dashboard appears only after the
+Fyers profile API confirms the session. Never commit `.env` or tokens.
 
 ## Dashboard behavior
 

@@ -149,7 +149,13 @@ def render_results(raw_history: pd.DataFrame, interval: int) -> None:
         )
 
 
-settings = Settings.from_environment()
+environment_settings = Settings.from_environment()
+settings = Settings(
+    client_id=st.session_state.get("login_client_id", environment_settings.client_id),
+    secret_key=st.session_state.get("login_secret_key", environment_settings.secret_key),
+    redirect_uri=st.session_state.get("login_redirect_uri", environment_settings.redirect_uri),
+    access_token=environment_settings.access_token,
+)
 client = FyersClient(settings)
 access_token = settings.access_token or st.session_state.get("fyers_access_token", "")
 profile_data: dict[str, object] = {}
@@ -179,15 +185,35 @@ def render_login_page() -> None:
     st.subheader("Sign in with Fyers", text_alignment="center")
     st.caption("Connect your Fyers account to load equity candles and turnover rankings.", text_alignment="center")
     with st.container(border=True):
-        if not settings.is_configured:
-            st.error("Fyers app configuration is missing.")
-            st.write("Set `FYERS_CLIENT_ID`, `FYERS_SECRET_KEY`, and `FYERS_REDIRECT_URI` before deploying.")
+        client_id = st.text_input(
+            "Fyers app ID",
+            value=settings.client_id,
+            key="login_client_id",
+            placeholder="Enter your Fyers app ID",
+        )
+        secret_key = st.text_input(
+            "Fyers secret key",
+            value=settings.secret_key,
+            type="password",
+            key="login_secret_key",
+            placeholder="Enter your Fyers secret key",
+        )
+        redirect_uri = st.text_input(
+            "Fyers redirect URI",
+            value=settings.redirect_uri or "http://localhost:8501",
+            key="login_redirect_uri",
+            help="This must exactly match the redirect URI registered in Fyers.",
+        )
+        if auth_error:
+            st.error(f"Fyers sign-in failed: {auth_error}")
+        st.write("Credentials are used by this server only to start the Fyers OAuth flow. The dashboard appears after your Fyers profile is verified.")
+        login_settings = Settings(client_id.strip(), secret_key.strip(), redirect_uri.strip())
+        if login_settings.is_configured:
+            login_client = FyersClient(login_settings)
+            st.link_button("Sign in with Fyers", login_client.authorization_url(), icon=":material/login:", width="stretch")
         else:
-            if auth_error:
-                st.error(f"Fyers sign-in failed: {auth_error}")
-            st.write("Your Fyers credentials stay with Fyers. This dashboard receives an OAuth callback and verifies your profile before showing market data.")
-            st.link_button("Sign in with Fyers", client.authorization_url(), icon=":material/login:", width="stretch")
-            st.caption(f"Redirect URI: {settings.redirect_uri}")
+            st.info("Enter the app ID, secret key, and redirect URI to continue.")
+        st.caption(f"Redirect URI: {redirect_uri}")
     st.caption("After sign-in, the dashboard downloads only the equity symbols in `- F&O Stocks.txt`.", text_alignment="center")
 
 
