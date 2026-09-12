@@ -1,0 +1,9 @@
+kagglehub
+matplotlib
+pandas
+python-dotenv
+requests
+streamlit
+fyers-apiv3
+pytest
+pyarrow

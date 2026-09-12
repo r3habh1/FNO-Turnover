@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.matplotlib-cache/
+outputs/
+.env
+data/
+fyersApi.log
+fyersDataSocket.log
+fyersRequests.log
