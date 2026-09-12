@@ -214,6 +214,14 @@ def render_login_page() -> None:
         else:
             st.info("Enter the app ID, secret key, and redirect URI to continue.")
         st.caption(f"Redirect URI: {redirect_uri}")
+    query_params = dict(st.query_params)
+    if query_params.get("s") == "error" or query_params.get("error"):
+        st.error(
+            "Fyers rejected the OAuth request: "
+            f"{query_params.get('message', query_params.get('error', 'unknown error'))}"
+        )
+    elif query_params and not query_params.get("auth_code"):
+        st.warning(f"OAuth callback received unexpected parameters: {', '.join(query_params)}")
     st.caption("After sign-in, the dashboard downloads only the equity symbols in `- F&O Stocks.txt`.", text_alignment="center")
 
 
