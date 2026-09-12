@@ -109,7 +109,7 @@ def aggregate_candles(data: pd.DataFrame, interval_minutes: int) -> pd.DataFrame
     ).reset_index(drop=True)
 
 
-def rank_top_stocks(candles: pd.DataFrame, limit: int = 3) -> pd.DataFrame:
+def rank_top_stocks(candles: pd.DataFrame, limit: int = 5) -> pd.DataFrame:
     """Return the highest-turnover stocks per date and candle."""
     if limit <= 0:
         raise ValueError("limit must be positive")

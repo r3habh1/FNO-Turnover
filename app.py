@@ -73,7 +73,7 @@ def format_ranked_snapshot(data: pd.DataFrame) -> pd.DataFrame:
             "Start": first["bucket_start"].strftime("%H:%M"),
             "End": first["bucket_end"].strftime("%H:%M"),
         }
-        for rank in (1, 2, 3):
+        for rank in (1, 2, 3,4,5):
             ranked = group[group["rank"] == rank]
             if ranked.empty:
                 row[f"Symbol {rank}"] = ""
@@ -107,7 +107,7 @@ def is_market_open() -> bool:
 
 def option_context_from_equity_group(group: pd.DataFrame, source: str) -> dict[str, object]:
     """Build the option scan context from one ranked equity candle group."""
-    ordered = group.sort_values("rank").head(3)
+    ordered = group.sort_values("rank").head(5)
     return {
         "source": source,
         "trade_date": ordered.iloc[0]["trading_date"],
@@ -324,7 +324,7 @@ def render_options_turnover(
         st.warning("Fyers returned no current-day 5-minute option candles for the selected contracts.")
         return
 
-    option_ranked = aggregate_option_turnover(selected_history, interval, limit=5)
+    option_ranked = aggregate_option_turnover(selected_history, interval, limit=10)
     option_ranked = option_ranked[
         (option_ranked["trading_date"] == trade_date)
         & (option_ranked["bucket_number"] == bucket_number)
@@ -442,7 +442,7 @@ with st.sidebar:
     st.header("Controls")
     start_date = st.date_input("From", value=date.today() - timedelta(days=7))
     end_date = st.date_input("To", value=date.today())
-    interval = st.selectbox("Candle interval", (15, 25, 75, 125), index=0, format_func=lambda value: f"{value} minutes")
+    interval = st.selectbox("Candle interval", (15, 25, 75, 125), index=2, format_func=lambda value: f"{value} minutes")
     st.divider()
     st.subheader("Connection")
     st.success("Connected to Fyers")
