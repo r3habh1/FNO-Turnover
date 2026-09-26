@@ -12,7 +12,7 @@ import streamlit as st
 from src.analytics import aggregate_candles, aggregate_option_turnover, rank_top_stocks
 from src.config import Settings
 from src.fyers_client import FyersClient
-from src.fy_path_analysis import completed_financial_years, load_current_nifty500, normalize_fy_paths, stock_path, stock_summary, cross_stock_snapshot
+from src.fy_path_analysis import all_stock_median_paths, completed_financial_years, load_current_nifty500, normalize_fy_paths, stock_path, stock_summary, cross_stock_snapshot
 from src.history_store import clear_all_downloads, clear_download, load_state, save_symbol_result
 from src.market_socket import MarketSocket
 from src.universe import build_equity_universe, build_option_universe, load_symbol_list, month_end_tuesday, option_expiries_for_underlyings
@@ -110,8 +110,8 @@ def load_nifty500_file() -> pd.DataFrame:
 def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
     st.header("Nifty 500 Financial-Year Path Analysis")
     st.caption(
-        "Current Nifty 500 constituents. Each financial year runs 1 Apr to 31 Mar and "
-        "is normalized to 0% on its first available trading day."
+        "Every stock is normalized independently to 0% on its first available trading day "
+        "in each financial year. Stocks with less than 10 years of history are kept."
     )
 
     universe = load_nifty500_file()
@@ -119,45 +119,92 @@ def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
     overall_start = years[0][1]
     overall_end = years[-1][2]
 
-    with st.sidebar:
-        st.divider()
-        st.subheader("FY Path Analysis")
+    symbols_plain = universe["Symbol"].tolist()
+    default_index = symbols_plain.index("RELIANCE") if "RELIANCE" in set(symbols_plain) else 0
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
         selected_symbol = st.selectbox(
-            "Stock",
-            universe["Symbol"].tolist(),
-            index=universe["Symbol"].tolist().index("RELIANCE") if "RELIANCE" in set(universe["Symbol"]) else 0,
+            "Stock selector",
+            symbols_plain,
+            index=default_index,
             key="fy_path_symbol",
         )
-        st.caption(f"{len(universe):,} current Nifty 500 constituents")
-        st.caption(f"Analysis: {years[0][0]} to {years[-1][0]}")
-        refresh_fy = st.button("Refresh FY path data", width="stretch", key="refresh_fy_path")
+    with col2:
+        view_mode = st.radio(
+            "Chart view",
+            ["All stocks", "Selected stock"],
+            horizontal=True,
+            key="fy_path_view_mode",
+        )
+    with col3:
+        st.metric("Nifty 500", len(universe))
+
+    st.caption(
+        f"Target period: {years[0][0]} → {years[-1][0]} | "
+        "history is retained even when a stock has fewer than 10 completed FYs."
+    )
+
+    with st.expander("Data download / cache", expanded=False):
+        st.write(
+            "The dashboard downloads daily history for every current Nifty 500 constituent "
+            "once and stores it locally. Completed downloads are skipped on later runs."
+        )
+        refresh_fy = st.button(
+            "Download missing + retry failed",
+            width="stretch",
+            key="refresh_fy_path",
+        )
+        clear_fy = st.button(
+            "Delete FY cache and download everything again",
+            width="stretch",
+            key="clear_fy_cache",
+        )
 
     namespace = "nifty500_fy_daily"
-    state = load_state(overall_start, overall_end, "D", namespace=namespace)
-    symbols = [f"NSE:{symbol}-EQ" for symbol in universe["Symbol"]]
-    pending = [symbol for symbol in symbols if symbol not in state.completed_symbols and symbol not in state.failed_symbols]
-
-    if refresh_fy:
+    if clear_fy:
         clear_download(overall_start, overall_end, "D", namespace=namespace)
-        state = load_state(overall_start, overall_end, "D", namespace=namespace)
-        pending = symbols
+
+    state = load_state(overall_start, overall_end, "D", namespace=namespace)
+    symbols = [f"NSE:{symbol}-EQ" for symbol in symbols_plain]
+
+    # Normal runs download only symbols never completed successfully.
+    # The explicit button also retries symbols previously marked as failed.
+    pending = [
+        symbol for symbol in symbols
+        if symbol not in state.completed_symbols
+        and (refresh_fy or symbol not in state.failed_symbols)
+    ]
 
     if pending:
         st.info(
-            f"FY path data cache is missing {len(pending):,} stocks. "
-            "Daily history will be downloaded once and then reused."
+            f"{len(pending):,} stocks need history. "
+            f"{len(state.completed_symbols):,} already cached successfully; "
+            f"{len(state.failed_symbols):,} are currently marked failed/no-data."
         )
         progress = st.progress(
-            len(symbols) - len(pending),
-            text=f"Downloaded {len(symbols) - len(pending):,} / {len(symbols):,}",
+            len(state.completed_symbols),
+            text=f"Downloaded {len(state.completed_symbols):,} / {len(symbols):,}",
         )
         status = st.empty()
 
-        def on_daily_symbol(completed: int, total: int, symbol: str, frame: pd.DataFrame | None, error: str | None) -> None:
+        def on_daily_symbol(
+            completed: int,
+            total: int,
+            symbol: str,
+            frame: pd.DataFrame | None,
+            error: str | None,
+        ) -> None:
             save_symbol_result(
-                overall_start, overall_end, symbol, frame, error, "D", namespace=namespace
+                overall_start,
+                overall_end,
+                symbol,
+                frame,
+                error,
+                "D",
+                namespace=namespace,
             )
-            current = len(symbols) - len(pending) + completed
+            current = len(state.completed_symbols) + completed
             progress.progress(
                 min(current / len(symbols), 1.0),
                 text=f"Downloaded {min(current, len(symbols)):,} / {len(symbols):,}",
@@ -176,37 +223,61 @@ def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
 
     raw = state.frame
     if raw.empty:
-        st.warning("No daily history is available yet.")
+        st.warning(
+            "No daily history is cached yet. Use 'Download missing + retry failed' "
+            "to start the Nifty 500 download."
+        )
         return
 
     paths = normalize_fy_paths(raw, years)
-    selected = stock_path(paths, selected_symbol, include_median=True)
-    summary = stock_summary(paths, selected_symbol)
-
-    company_row = universe[universe["Symbol"].eq(selected_symbol)]
-    company_name = company_row.iloc[0]["Company Name"] if not company_row.empty else selected_symbol
-    st.subheader(f"{selected_symbol} — {company_name}")
-
-    if selected.empty:
-        st.warning(f"No FY path data is available for {selected_symbol}.")
+    if paths.empty:
+        st.warning("The cached history contains no usable daily closes for the selected FY range.")
         return
 
-    chart_data = selected.set_index("FY Day")
-    st.line_chart(chart_data, height=520)
+    snapshot = cross_stock_snapshot(paths)
 
-    st.caption(
-        "X-axis = trading-day position within the financial year. "
-        "Y-axis = cumulative price change from that FY's first available close."
+    if view_mode == "All stocks":
+        st.subheader("All Nifty 500 stocks — normalized median paths")
+        st.caption(
+            "One line per stock. Each line is the median cumulative return at each trading-day "
+            "position across all financial years available for that stock."
+        )
+        all_paths = all_stock_median_paths(paths)
+        st.line_chart(all_paths.set_index("FY Day"), height=650)
+
+        selected = stock_path(paths, selected_symbol, include_median=True)
+        company_row = universe[universe["Symbol"].eq(selected_symbol)]
+        company_name = company_row.iloc[0]["Company Name"] if not company_row.empty else selected_symbol
+        st.subheader(f"Selected: {selected_symbol} — {company_name}")
+        if not selected.empty:
+            st.line_chart(selected.set_index("FY Day"), height=450)
+    else:
+        selected = stock_path(paths, selected_symbol, include_median=True)
+        company_row = universe[universe["Symbol"].eq(selected_symbol)]
+        company_name = company_row.iloc[0]["Company Name"] if not company_row.empty else selected_symbol
+        st.subheader(f"{selected_symbol} — {company_name}")
+        if selected.empty:
+            st.warning(f"No FY path data is available for {selected_symbol}.")
+        else:
+            st.line_chart(selected.set_index("FY Day"), height=520)
+
+    summary = stock_summary(paths, selected_symbol)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Years available", f"{len(summary)}")
+    c2.metric(
+        "Positive FYs",
+        f"{int(summary['Positive'].sum())}/{len(summary)}" if not summary.empty else "-",
+    )
+    c3.metric(
+        "Median FY return",
+        f"{summary['FY Return %'].median():.2f}%" if not summary.empty else "-",
+    )
+    c4.metric(
+        "Average FY return",
+        f"{summary['FY Return %'].mean():.2f}%" if not summary.empty else "-",
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    latest_year = summary.iloc[-1] if not summary.empty else None
-    c1.metric("Years available", f"{len(summary)}")
-    c2.metric("Positive FYs", f"{int(summary['Positive'].sum())}/{len(summary)}" if not summary.empty else "-")
-    c3.metric("Median FY return", f"{summary['FY Return %'].median():.2f}%" if not summary.empty else "-")
-    c4.metric("Average FY return", f"{summary['FY Return %'].mean():.2f}%" if not summary.empty else "-")
-
-    with st.expander("Financial-year summary", expanded=True):
+    with st.expander("Selected stock — financial-year summary", expanded=True):
         st.dataframe(
             summary.style.format(
                 {
@@ -218,10 +289,10 @@ def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
             hide_index=True,
         )
 
-    with st.expander("Current Nifty 500 snapshot"):
-        snapshot = cross_stock_snapshot(paths)
+    with st.expander("All Nifty 500 — history coverage + statistics", expanded=True):
+        coverage = snapshot.copy()
         st.dataframe(
-            snapshot.head(100).style.format(
+            coverage.style.format(
                 {
                     "Positive FY %": "{:.1f}%",
                     "Average FY Return %": "{:.2f}%",
@@ -229,14 +300,23 @@ def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
                 }
             ),
             hide_index=True,
+            height=600,
         )
         st.download_button(
-            "Download Nifty 500 FY statistics",
-            snapshot.to_csv(index=False).encode("utf-8"),
+            "Download all Nifty 500 FY statistics",
+            coverage.to_csv(index=False).encode("utf-8"),
             file_name="nifty500_fy_path_statistics.csv",
             mime="text/csv",
             key="download_fy_stats",
         )
+
+    if state.failed_symbols:
+        with st.expander(f"Stocks with no/failed history ({len(state.failed_symbols)})"):
+            failed_rows = pd.DataFrame(
+                [{"Symbol": symbol.replace("NSE:", "").removesuffix("-EQ"), "Reason": reason}
+                 for symbol, reason in state.failed_symbols.items()]
+            )
+            st.dataframe(failed_rows, hide_index=True)
 
 def is_market_open() -> bool:
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
