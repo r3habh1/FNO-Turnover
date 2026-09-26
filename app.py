@@ -235,6 +235,16 @@ def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
         return
 
     snapshot = cross_stock_snapshot(paths)
+    coverage = universe[["Symbol", "Company Name"]].merge(
+        snapshot,
+        on="Symbol",
+        how="left",
+    )
+    coverage["Data Status"] = coverage["Years Available"].apply(
+        lambda value: "No data" if pd.isna(value) else "Available"
+    )
+    coverage["Years Available"] = coverage["Years Available"].fillna(0).astype(int)
+    coverage["Positive FYs"] = coverage["Positive FYs"].fillna(0).astype(int)
 
     if view_mode == "All stocks":
         st.subheader("All Nifty 500 stocks — normalized median paths")
@@ -290,7 +300,6 @@ def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
         )
 
     with st.expander("All Nifty 500 — history coverage + statistics", expanded=True):
-        coverage = snapshot.copy()
         st.dataframe(
             coverage.style.format(
                 {
