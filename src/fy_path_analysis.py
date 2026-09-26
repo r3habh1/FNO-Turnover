@@ -20,7 +20,7 @@ def completed_financial_years(end_date: date | None = None, years: int = 10) -> 
             date(end_year - 1, 4, 1),
             date(end_year, 3, 31),
         )
-        for end_year in range(first_end_year, last_end_year + 1)
+        for end_year in range(first_end_year, last_fy_end_year + 1)
     ]
 
 
