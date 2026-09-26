@@ -87,6 +87,26 @@ def normalize_fy_paths(
     return pd.concat(output, ignore_index=True)
 
 
+def all_stock_median_paths(paths: pd.DataFrame) -> pd.DataFrame:
+    """Build one normalized median path per stock using all FYs available for that stock."""
+    if paths.empty:
+        return pd.DataFrame(columns=["FY Day"])
+
+    median_by_day = (
+        paths.groupby(["symbol", "fy_day"], as_index=False)["return_pct"]
+        .median()
+    )
+    wide = median_by_day.pivot_table(
+        index="fy_day",
+        columns="symbol",
+        values="return_pct",
+        aggfunc="last",
+    ).sort_index()
+    wide.index.name = "FY Day"
+    wide.reset_index(inplace=True)
+    return wide
+
+
 def stock_path(paths: pd.DataFrame, symbol: str, include_median: bool = True) -> pd.DataFrame:
     """Build a wide chart dataframe with one column per FY path."""
     selected = paths[paths["symbol"].eq(symbol)].copy()
@@ -140,6 +160,8 @@ def cross_stock_snapshot(paths: pd.DataFrame) -> pd.DataFrame:
             {
                 "Symbol": symbol,
                 "Years Available": year_end["fy"].nunique(),
+                "First FY": str(year_end["fy"].iloc[0]),
+                "Latest FY": str(year_end["fy"].iloc[-1]),
                 "Positive FYs": int((year_end["return_pct"] >= 0).sum()),
                 "Positive FY %": float((year_end["return_pct"] >= 0).mean() * 100),
                 "Average FY Return %": float(year_end["return_pct"].mean()),
