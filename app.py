@@ -12,6 +12,7 @@ import streamlit as st
 from src.analytics import aggregate_candles, aggregate_option_turnover, rank_top_stocks
 from src.config import Settings
 from src.fyers_client import FyersClient
+from src.fy_path_analysis import completed_financial_years, load_current_nifty500, normalize_fy_paths, stock_path, stock_summary, cross_stock_snapshot
 from src.history_store import clear_all_downloads, clear_download, load_state, save_symbol_result
 from src.market_socket import MarketSocket
 from src.universe import build_equity_universe, build_option_universe, load_symbol_list, month_end_tuesday, option_expiries_for_underlyings
@@ -99,6 +100,143 @@ def highlight_new_dates(frame: pd.DataFrame) -> pd.DataFrame:
         previous_date = current_date
     return styles
 
+
+@st.cache_data(ttl=24 * 60 * 60)
+def load_nifty500_file() -> pd.DataFrame:
+    path = Path(__file__).with_name("data") / "nifty500_current.csv"
+    return load_current_nifty500(str(path))
+
+
+def render_fy_path_analysis(client: FyersClient, access_token: str) -> None:
+    st.header("Nifty 500 Financial-Year Path Analysis")
+    st.caption(
+        "Current Nifty 500 constituents. Each financial year runs 1 Apr to 31 Mar and "
+        "is normalized to 0% on its first available trading day."
+    )
+
+    universe = load_nifty500_file()
+    years = completed_financial_years(years=10)
+    overall_start = years[0][1]
+    overall_end = years[-1][2]
+
+    with st.sidebar:
+        st.divider()
+        st.subheader("FY Path Analysis")
+        selected_symbol = st.selectbox(
+            "Stock",
+            universe["Symbol"].tolist(),
+            index=universe["Symbol"].tolist().index("RELIANCE") if "RELIANCE" in set(universe["Symbol"]) else 0,
+            key="fy_path_symbol",
+        )
+        st.caption(f"{len(universe):,} current Nifty 500 constituents")
+        st.caption(f"Analysis: {years[0][0]} to {years[-1][0]}")
+        refresh_fy = st.button("Refresh FY path data", width="stretch", key="refresh_fy_path")
+
+    namespace = "nifty500_fy_daily"
+    state = load_state(overall_start, overall_end, "D", namespace=namespace)
+    symbols = [f"NSE:{symbol}-EQ" for symbol in universe["Symbol"]]
+    pending = [symbol for symbol in symbols if symbol not in state.completed_symbols and symbol not in state.failed_symbols]
+
+    if refresh_fy:
+        clear_download(overall_start, overall_end, "D", namespace=namespace)
+        state = load_state(overall_start, overall_end, "D", namespace=namespace)
+        pending = symbols
+
+    if pending:
+        st.info(
+            f"FY path data cache is missing {len(pending):,} stocks. "
+            "Daily history will be downloaded once and then reused."
+        )
+        progress = st.progress(
+            len(symbols) - len(pending),
+            text=f"Downloaded {len(symbols) - len(pending):,} / {len(symbols):,}",
+        )
+        status = st.empty()
+
+        def on_daily_symbol(completed: int, total: int, symbol: str, frame: pd.DataFrame | None, error: str | None) -> None:
+            save_symbol_result(
+                overall_start, overall_end, symbol, frame, error, "D", namespace=namespace
+            )
+            current = len(symbols) - len(pending) + completed
+            progress.progress(
+                min(current / len(symbols), 1.0),
+                text=f"Downloaded {min(current, len(symbols)):,} / {len(symbols):,}",
+            )
+            status.write(f"{symbol}: {'ok' if not error else error}")
+
+        client.history_for_symbols(
+            pending,
+            overall_start,
+            overall_end,
+            resolution="D",
+            chunk_days=365,
+            progress_callback=on_daily_symbol,
+        )
+        state = load_state(overall_start, overall_end, "D", namespace=namespace)
+
+    raw = state.frame
+    if raw.empty:
+        st.warning("No daily history is available yet.")
+        return
+
+    paths = normalize_fy_paths(raw, years)
+    selected = stock_path(paths, selected_symbol, include_median=True)
+    summary = stock_summary(paths, selected_symbol)
+
+    company_row = universe[universe["Symbol"].eq(selected_symbol)]
+    company_name = company_row.iloc[0]["Company Name"] if not company_row.empty else selected_symbol
+    st.subheader(f"{selected_symbol} — {company_name}")
+
+    if selected.empty:
+        st.warning(f"No FY path data is available for {selected_symbol}.")
+        return
+
+    chart_data = selected.set_index("FY Day")
+    st.line_chart(chart_data, height=520)
+
+    st.caption(
+        "X-axis = trading-day position within the financial year. "
+        "Y-axis = cumulative price change from that FY's first available close."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    latest_year = summary.iloc[-1] if not summary.empty else None
+    c1.metric("Years available", f"{len(summary)}")
+    c2.metric("Positive FYs", f"{int(summary['Positive'].sum())}/{len(summary)}" if not summary.empty else "-")
+    c3.metric("Median FY return", f"{summary['FY Return %'].median():.2f}%" if not summary.empty else "-")
+    c4.metric("Average FY return", f"{summary['FY Return %'].mean():.2f}%" if not summary.empty else "-")
+
+    with st.expander("Financial-year summary", expanded=True):
+        st.dataframe(
+            summary.style.format(
+                {
+                    "FY Return %": "{:.2f}%",
+                    "Best %": "{:.2f}%",
+                    "Worst %": "{:.2f}%",
+                }
+            ),
+            hide_index=True,
+        )
+
+    with st.expander("Current Nifty 500 snapshot"):
+        snapshot = cross_stock_snapshot(paths)
+        st.dataframe(
+            snapshot.head(100).style.format(
+                {
+                    "Positive FY %": "{:.1f}%",
+                    "Average FY Return %": "{:.2f}%",
+                    "Median FY Return %": "{:.2f}%",
+                }
+            ),
+            hide_index=True,
+        )
+        st.download_button(
+            "Download Nifty 500 FY statistics",
+            snapshot.to_csv(index=False).encode("utf-8"),
+            file_name="nifty500_fy_path_statistics.csv",
+            mime="text/csv",
+            key="download_fy_stats",
+        )
 
 def is_market_open() -> bool:
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
@@ -438,118 +576,125 @@ if not access_token:
 st.title("F&O Turnover Leaders")
 st.caption("Top three NSE F&O equity stocks by estimated turnover in each intraday candle.")
 
-with st.sidebar:
-    st.header("Controls")
-    start_date = st.date_input("From", value=date.today() - timedelta(days=7))
-    end_date = st.date_input("To", value=date.today())
-    interval = st.selectbox("Candle interval", (15, 25, 75, 125), index=2, format_func=lambda value: f"{value} minutes")
-    st.divider()
-    st.subheader("Connection")
-    st.success("Connected to Fyers")
-    st.write(f"**Name:** {profile_data.get('name', 'Unavailable')}")
-    st.write(f"**Email:** {profile_data.get('email_id', profile_data.get('email', 'Unavailable'))}")
-    st.write(f"**Account:** {profile_data.get('fy_id', profile_data.get('fyToken', 'Unavailable'))}")
+main_tab, fy_tab = st.tabs(["F&O Turnover", "Nifty 500 FY Paths"])
 
-    refresh = st.button("Refresh equity master", width="stretch")
-    retry_download = st.button("Download all from scratch", width="stretch")
-    market_open = is_market_open()
-    live_refresh_enabled = st.toggle(
-        "Live refresh every 15 minutes",
-        value=market_open and end_date == date.today(),
-        disabled=not market_open or end_date != date.today(),
-        help="Reload selected current-day equity history every 15 minutes during NSE market hours.",
-    )
-    live_socket_enabled = st.toggle(
-        "Connect live market WebSocket",
-        value=False,
-        disabled=not market_open,
-    )
-    if not market_open:
-        st.caption("Live refresh is disabled outside NSE hours: 09:15–15:30 IST.")
+with fy_tab:
+    render_fy_path_analysis(client, access_token)
 
-if start_date > end_date:
-    st.error("The start date must be on or before the end date.")
-    st.stop()
+with main_tab:
 
-try:
-    client.set_access_token(access_token)
-    if refresh:
-        load_universe.clear()
-        load_fo_master.clear()
-    universe = load_universe()
-    stock_file = Path(__file__).with_name("- F&O Stocks.txt")
-    file_symbols = load_symbol_list(stock_file) if stock_file.exists() else []
-    watchlist_symbols = build_equity_universe(universe, file_symbols)["symbol"].tolist()
-    if not watchlist_symbols:
-        st.error("No valid equity symbols were found in - F&O Stocks.txt.")
+    with st.sidebar:
+        st.header("Controls")
+        start_date = st.date_input("From", value=date.today() - timedelta(days=7))
+        end_date = st.date_input("To", value=date.today())
+        interval = st.selectbox("Candle interval", (15, 25, 75, 125), index=2, format_func=lambda value: f"{value} minutes")
+        st.divider()
+        st.subheader("Connection")
+        st.success("Connected to Fyers")
+        st.write(f"**Name:** {profile_data.get('name', 'Unavailable')}")
+        st.write(f"**Email:** {profile_data.get('email_id', profile_data.get('email', 'Unavailable'))}")
+        st.write(f"**Account:** {profile_data.get('fy_id', profile_data.get('fyToken', 'Unavailable'))}")
+
+        refresh = st.button("Refresh equity master", width="stretch")
+        retry_download = st.button("Download all from scratch", width="stretch")
+        market_open = is_market_open()
+        live_refresh_enabled = st.toggle(
+            "Live refresh every 15 minutes",
+            value=market_open and end_date == date.today(),
+            disabled=not market_open or end_date != date.today(),
+            help="Reload selected current-day equity history every 15 minutes during NSE market hours.",
+        )
+        live_socket_enabled = st.toggle(
+            "Connect live market WebSocket",
+            value=False,
+            disabled=not market_open,
+        )
+        if not market_open:
+            st.caption("Live refresh is disabled outside NSE hours: 09:15–15:30 IST.")
+
+    if start_date > end_date:
+        st.error("The start date must be on or before the end date.")
         st.stop()
-    missing_file_symbols = sorted(set(file_symbols) - set(watchlist_symbols))
-    st.metric("Equity stocks in file", f"{len(watchlist_symbols):,}")
-    if missing_file_symbols:
-        st.warning(f"{len(missing_file_symbols):,} symbols in the file are not available in the current cash master.")
-    st.caption("Using - F&O Stocks.txt. Historical and live requests contain only NSE cash-equity symbols ending in -EQ.")
-    def download_and_render(force_refresh: bool) -> None:
-        history_start = start_date
-        history_end = end_date
-        if retry_download:
-            deleted_files = clear_all_downloads()
-            st.info(f"Cleared {deleted_files} old history cache files.")
-        elif force_refresh:
-            clear_download(history_start, history_end, "5")
-            st.caption("Live refresh: reloading the selected current-day range.")
-        history_state = load_state(history_start, history_end, "5")
-        pending_symbols = [
-            symbol for symbol in watchlist_symbols
-            if symbol not in history_state.completed_symbols and symbol not in history_state.failed_symbols
-        ]
-        st.subheader("Historical 5-minute data")
-        completed_count = len(history_state.completed_symbols.intersection(set(watchlist_symbols)))
-        progress = completed_count / len(watchlist_symbols) if watchlist_symbols else 0
-        st.progress(progress, text=f"Downloaded {completed_count:,} / {len(watchlist_symbols):,} stocks ({progress:.1%})")
-        st.caption(f"Pending: {len(pending_symbols):,} stocks. Cache: {history_start} to {history_end}.")
-        if pending_symbols:
-            download_progress = st.progress(progress, text="Downloading equity candles...")
-            download_status = st.empty()
 
-            def on_symbol(completed: int, total: int, symbol: str, frame: pd.DataFrame | None, error: str | None) -> None:
-                save_symbol_result(history_start, history_end, symbol, frame, error, "5")
-                current = completed_count + completed
-                ratio = current / len(watchlist_symbols) if watchlist_symbols else 1
-                download_progress.progress(min(ratio, 1.0), text=f"Downloaded {current:,} / {len(watchlist_symbols):,} stocks ({ratio:.1%})")
-                download_status.write(f"{symbol}: {'ok' if not error else error}")
-
-            client.history_for_symbols(pending_symbols, history_start, history_end, resolution="5", progress_callback=on_symbol)
+    try:
+        client.set_access_token(access_token)
+        if refresh:
+            load_universe.clear()
+            load_fo_master.clear()
+        universe = load_universe()
+        stock_file = Path(__file__).with_name("- F&O Stocks.txt")
+        file_symbols = load_symbol_list(stock_file) if stock_file.exists() else []
+        watchlist_symbols = build_equity_universe(universe, file_symbols)["symbol"].tolist()
+        if not watchlist_symbols:
+            st.error("No valid equity symbols were found in - F&O Stocks.txt.")
+            st.stop()
+        missing_file_symbols = sorted(set(file_symbols) - set(watchlist_symbols))
+        st.metric("Equity stocks in file", f"{len(watchlist_symbols):,}")
+        if missing_file_symbols:
+            st.warning(f"{len(missing_file_symbols):,} symbols in the file are not available in the current cash master.")
+        st.caption("Using - F&O Stocks.txt. Historical and live requests contain only NSE cash-equity symbols ending in -EQ.")
+        def download_and_render(force_refresh: bool) -> None:
+            history_start = start_date
+            history_end = end_date
+            if retry_download:
+                deleted_files = clear_all_downloads()
+                st.info(f"Cleared {deleted_files} old history cache files.")
+            elif force_refresh:
+                clear_download(history_start, history_end, "5")
+                st.caption("Live refresh: reloading the selected current-day range.")
             history_state = load_state(history_start, history_end, "5")
+            pending_symbols = [
+                symbol for symbol in watchlist_symbols
+                if symbol not in history_state.completed_symbols and symbol not in history_state.failed_symbols
+            ]
+            st.subheader("Historical 5-minute data")
+            completed_count = len(history_state.completed_symbols.intersection(set(watchlist_symbols)))
+            progress = completed_count / len(watchlist_symbols) if watchlist_symbols else 0
+            st.progress(progress, text=f"Downloaded {completed_count:,} / {len(watchlist_symbols):,} stocks ({progress:.1%})")
+            st.caption(f"Pending: {len(pending_symbols):,} stocks. Cache: {history_start} to {history_end}.")
+            if pending_symbols:
+                download_progress = st.progress(progress, text="Downloading equity candles...")
+                download_status = st.empty()
+
+                def on_symbol(completed: int, total: int, symbol: str, frame: pd.DataFrame | None, error: str | None) -> None:
+                    save_symbol_result(history_start, history_end, symbol, frame, error, "5")
+                    current = completed_count + completed
+                    ratio = current / len(watchlist_symbols) if watchlist_symbols else 1
+                    download_progress.progress(min(ratio, 1.0), text=f"Downloaded {current:,} / {len(watchlist_symbols):,} stocks ({ratio:.1%})")
+                    download_status.write(f"{symbol}: {'ok' if not error else error}")
+
+                client.history_for_symbols(pending_symbols, history_start, history_end, resolution="5", progress_callback=on_symbol)
+                history_state = load_state(history_start, history_end, "5")
+                if history_state.failed_symbols:
+                    st.warning(f"{len(history_state.failed_symbols):,} symbols failed. See download errors below.")
+                else:
+                    st.success("All watchlist equity data downloaded.")
+
             if history_state.failed_symbols:
-                st.warning(f"{len(history_state.failed_symbols):,} symbols failed. See download errors below.")
-            else:
-                st.success("All watchlist equity data downloaded.")
+                with st.expander(f"Download errors ({len(history_state.failed_symbols):,})"):
+                    st.dataframe(
+                        pd.DataFrame([{"Symbol": symbol, "Error": message} for symbol, message in sorted(history_state.failed_symbols.items())]),
+                        hide_index=True,
+                    )
+            raw_history = history_state.frame
+            if raw_history.empty:
+                st.warning("Fyers returned no 5-minute candles for the selected range.")
+                return
+            if live_socket_enabled:
+                market_socket = get_market_socket(access_token)
+                market_socket.start(list(watchlist_symbols))
+                st.info(f"Live WebSocket: {market_socket.status}")
+            ranked, option_context = render_results(raw_history, interval)
+            if not ranked.empty and option_context:
+                render_options_turnover(client, option_context, interval, force_refresh)
 
-        if history_state.failed_symbols:
-            with st.expander(f"Download errors ({len(history_state.failed_symbols):,})"):
-                st.dataframe(
-                    pd.DataFrame([{"Symbol": symbol, "Error": message} for symbol, message in sorted(history_state.failed_symbols.items())]),
-                    hide_index=True,
-                )
-        raw_history = history_state.frame
-        if raw_history.empty:
-            st.warning("Fyers returned no 5-minute candles for the selected range.")
-            return
-        if live_socket_enabled:
-            market_socket = get_market_socket(access_token)
-            market_socket.start(list(watchlist_symbols))
-            st.info(f"Live WebSocket: {market_socket.status}")
-        ranked, option_context = render_results(raw_history, interval)
-        if not ranked.empty and option_context:
-            render_options_turnover(client, option_context, interval, force_refresh)
+        if live_refresh_enabled:
+            @st.fragment(run_every="15m")
+            def live_dashboard() -> None:
+                download_and_render(force_refresh=True)
 
-    if live_refresh_enabled:
-        @st.fragment(run_every="15m")
-        def live_dashboard() -> None:
-            download_and_render(force_refresh=True)
-
-        live_dashboard()
-    else:
-        download_and_render(force_refresh=False)
-except Exception as error:
-    st.error(f"Unable to load Fyers data: {error}")
+            live_dashboard()
+        else:
+            download_and_render(force_refresh=False)
+    except Exception as error:
+        st.error(f"Unable to load Fyers data: {error}")
